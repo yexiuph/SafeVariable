@@ -15,6 +15,9 @@
 #include <numeric>
 #include <stdexcept>
 
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+
 /**
  * @file    SafeVar.hpp
  * @brief   Secure variable wrapper and memory safety utilities for obfuscation and anti-cheat.
@@ -29,7 +32,7 @@
  */
 
 
-// Utility to load 32-bit little-endian integers
+ // Utility to load 32-bit little-endian integers
 inline uint32_t LoadLE32 ( const uint8_t* src )
 {
 	return static_cast< uint32_t >( src [ 0 ] ) |
@@ -263,6 +266,11 @@ private:
 	std::array<uint8_t, 12> nonce;
 	mutable uint32_t lastChecksum = 0;
 	bool isValid = false;
+	static constexpr uint32_t CANARY = 0xDEADC0DE;
+	uint32_t preCanary = CANARY;
+	uint32_t postCanary = CANARY;
+	alignas( T ) std::array<uint8_t, VALUE_SIZE> shadowBuffer;
+	alignas( T ) std::array<uint8_t, VALUE_SIZE> shadowKey;
 
 private:
 	// Add a state structure to ensure consistent encryption/decryption
@@ -302,6 +310,29 @@ private:
 		);
 	}
 
+	void Obfuscate (
+		const T& value,
+		std::array<uint8_t, VALUE_SIZE>& outBuffer,
+		const std::array<uint8_t, VALUE_SIZE>& keyIn,
+		const std::array<uint8_t, 12>& nonceIn
+	) const
+	{
+		CryptoState cryptoState;
+		cryptoState.fullKey.fill ( 0 );
+		std::copy ( keyIn.begin ( ), keyIn.end ( ), cryptoState.fullKey.begin ( ) );
+		cryptoState.temp.fill ( 0 );
+
+		std::memcpy ( cryptoState.temp.data ( ), &value, VALUE_SIZE );
+
+		ChaCha20::Encrypt (
+			cryptoState.temp.data ( ),
+			outBuffer.data ( ),
+			VALUE_SIZE,
+			cryptoState.fullKey.data ( ),
+			nonceIn.data ( )
+		);
+	}
+
 	T Deobfuscate ( const std::array<uint8_t, VALUE_SIZE>& inBuffer ) const
 	{
 		CryptoState cryptoState;
@@ -314,6 +345,30 @@ private:
 			VALUE_SIZE,
 			cryptoState.fullKey.data ( ),
 			nonce.data ( )
+		);
+
+		T result;
+		std::memcpy ( &result, cryptoState.temp.data ( ), VALUE_SIZE );
+		return result;
+	}
+
+	T Deobfuscate ( const std::array<uint8_t, VALUE_SIZE>& inBuffer,
+		const std::array<uint8_t, VALUE_SIZE>& keyIn,
+		const std::array<uint8_t, 12>& nonceIn ) const
+	{
+		CryptoState cryptoState;
+		// Zero initialize the full key
+		cryptoState.fullKey.fill ( 0 );
+		std::copy ( keyIn.begin ( ), keyIn.end ( ), cryptoState.fullKey.begin ( ) );
+		cryptoState.temp.fill ( 0 );
+
+		// Decrypt with provided key/nonce
+		ChaCha20::Encrypt (
+			inBuffer.data ( ),
+			cryptoState.temp.data ( ),
+			VALUE_SIZE,
+			cryptoState.fullKey.data ( ),
+			nonceIn.data ( )
 		);
 
 		T result;
@@ -351,37 +406,83 @@ public:
 
 	T Get ( bool encrypted = false ) const
 	{
-		if ( !realMemory ) {
-			throw std::runtime_error ( "Invalid memory state" );
+		if ( preCanary != CANARY || postCanary != CANARY )
+			throw std::runtime_error ( "Buffer overflow/underrun detected" );
+
+		static thread_local bool inGet = false;
+		if ( inGet ) {
+			// Prevent recursion
+			throw std::runtime_error ( "Recursive call to SafeVar::Get() detected" );
 		}
+		inGet = true;
 
-		if ( !ValidateMemory ( ) ) {
-			throw std::runtime_error ( "Memory validation failed" );
+		try {
+			if ( !realMemory ) {
+				throw std::runtime_error ( "Invalid memory state" );
+			}
+
+			if ( !ValidateMemory ( ) ) {
+				throw std::runtime_error ( "Memory validation failed" );
+			}
+
+			// Integrity check: detect memory freezing/tampering
+			uint32_t currentChecksum = ComputeChecksumFNV ( buffer.data ( ), buffer.size ( ) );
+			if ( currentChecksum != lastChecksum ) {
+				throw std::runtime_error ( "Integrity check failed: possible memory freezing or tampering detected" );
+			}
+
+			// Breakpoint detection (basic)
+			void* addr = _ReturnAddress ( );
+			if ( IsBreakpointPresent ( addr ) ) {
+				throw std::runtime_error ( "Breakpoint detected in SafeVar::Get()" );
+			}
+
+			if ( encrypted ) {
+				T raw;
+				std::memcpy ( &raw, buffer.data ( ), VALUE_SIZE );
+				return raw;
+			}
+
+			// First decryption
+			T decrypted = Deobfuscate ( buffer );
+			T shadowDecrypted = Deobfuscate ( shadowBuffer, shadowKey, nonce );
+			if ( decrypted != shadowDecrypted )
+				throw std::runtime_error ( "Memory tampering detected: shadow copy mismatch" );
+
+			// Verify decryption by re-encrypting and comparing
+			std::array<uint8_t, VALUE_SIZE> verify;
+			Obfuscate ( decrypted, verify );
+
+			if ( verify != buffer ) {
+				throw std::runtime_error ( "Decryption verification failed" );
+			}
+
+			// Optional: re-key after each access to break static freezing
+			const_cast< SafeVar* >( this )->ReKey ( );
+
+			inGet = false;
+			return decrypted;
 		}
-
-		if ( encrypted ) {
-			T raw;
-			std::memcpy ( &raw, buffer.data ( ), VALUE_SIZE );
-			return raw;
+		catch ( ... ) {
+			inGet = false;
+			throw;
 		}
-
-		// First decryption
-		T decrypted = Deobfuscate ( buffer );
-
-		// Verify decryption by re-encrypting and comparing
-		std::array<uint8_t, VALUE_SIZE> verify;
-		Obfuscate ( decrypted, verify );
-
-		if ( verify != buffer ) {
-			throw std::runtime_error ( "Decryption verification failed" );
-		}
-
-		return decrypted;
 	}
 
 	const std::array<uint8_t, VALUE_SIZE>& GetInternalValue ( ) const
 	{
 		return buffer;
+	}
+
+	static bool IsBreakpointPresent ( void* address, size_t length = 16 )
+	{
+		uint8_t* code = reinterpret_cast< uint8_t* >( address );
+		for ( size_t i = 0; i < length; ++i ) {
+			if ( code [ i ] == 0xCC ) { // INT3
+				return true;
+			}
+		}
+		return false;
 	}
 
 	T Set ( const T& value )
@@ -390,6 +491,7 @@ public:
 		GenerateKey ( key );
 		GenerateNonce ( nonce );
 		Obfuscate ( value, buffer );
+		Obfuscate ( value, shadowBuffer, shadowKey, nonce );
 		realMemory = RealMemoryAllocator::AllocateRealMemory ( VALUE_SIZE );
 		if ( !realMemory ) throw std::runtime_error ( "Memory allocation failed" );
 		std::memcpy ( realMemory, buffer.data ( ), VALUE_SIZE );
@@ -401,7 +503,7 @@ public:
 
 	void ReKey ( )
 	{
-		T current = Get ( );
+		T current = Deobfuscate ( buffer );
 		Set ( current );
 	}
 
